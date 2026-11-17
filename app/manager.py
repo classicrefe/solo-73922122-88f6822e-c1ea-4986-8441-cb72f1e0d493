@@ -22,7 +22,7 @@ from typing import Any
 
 from . import db as dbmod
 from .config import settings
-from .external_merge import JobCancelled, reconcile_sorted
+from .external_merge import JobCancelled, MemoryBudget, reconcile_sorted
 from .models import TERMINAL_STATUSES, JobOut, ReconcileResult, DiffRow
 from .sqlvalidation import validate_select
 
@@ -168,6 +168,8 @@ class JobManager:
 
         session = dbmod.SnapshotSession()
         job.session = session
+        # 双路读取共享同一份内存预算：两侧行缓冲估算字节之和的硬上限
+        read_budget = MemoryBudget(settings.read_memory_budget)
         try:
             session.open()
             if is_cancelled():
@@ -179,14 +181,16 @@ class JobManager:
             t_left = threading.Thread(
                 target=self._read_side,
                 args=(session.readers[0], job.left_sql, f"recon_l_{job.job_id[:8]}",
-                      tempdir, "left", left_out, is_cancelled, check_deadline),
+                      tempdir, "left", left_out, is_cancelled, check_deadline,
+                      read_budget),
                 name="reader-left",
                 daemon=True,
             )
             t_right = threading.Thread(
                 target=self._read_side,
                 args=(session.readers[1], job.right_sql, f"recon_r_{job.job_id[:8]}",
-                      tempdir, "right", right_out, is_cancelled, check_deadline),
+                      tempdir, "right", right_out, is_cancelled, check_deadline,
+                      read_budget),
                 name="reader-right",
                 daemon=True,
             )
@@ -269,7 +273,7 @@ class JobManager:
         self._finalize(job, status="succeeded", error=None, result=result)
 
     def _read_side(self, conn, sql, cursor_name, tempdir, side, out,
-                   is_cancelled, check_deadline) -> None:
+                   is_cancelled, check_deadline, read_budget) -> None:
         try:
             columns, runs, total = dbmod.describe_and_stream(
                 conn=conn,
@@ -277,6 +281,9 @@ class JobManager:
                 cursor_name=cursor_name,
                 work_dir=tempdir,
                 chunk_rows=settings.chunk_rows,
+                chunk_bytes=settings.chunk_bytes,
+                fetch_batch_rows=settings.fetch_batch_rows,
+                budget=read_budget,
                 is_cancelled=is_cancelled,
                 deadline_check=check_deadline,
             )

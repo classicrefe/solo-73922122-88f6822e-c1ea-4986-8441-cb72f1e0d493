@@ -154,22 +154,35 @@ def describe_and_stream(
     cursor_name: str,
     work_dir: str,
     chunk_rows: int,
+    chunk_bytes: int,
+    fetch_batch_rows: int,
+    budget,
     is_cancelled,
     deadline_check,
 ) -> tuple[list[ColumnMeta], list[str], int]:
     """执行 SQL，校验结果列类型，并把结果流式写成外部排序 run 文件。
 
     返回 (列元数据, run 文件路径列表, 拉取总行数)。
-    使用命名服务端游标：psycopg 仅在 fetchmany 时按 itersize 传输。
+    使用命名服务端游标：psycopg 仅在 fetchmany 时按 itersize 传输；
+    itersize 受 fetch_batch_rows 限制，避免宽行批次的瞬时驻留失控。
+    行缓冲的驻留字节通过共享 MemoryBudget 与另一侧共同受限。
     """
     from .external_merge import RunWriter  # 避免循环导入
 
-    writer = RunWriter(work_dir=work_dir, chunk_rows=chunk_rows)
+    writer = RunWriter(
+        work_dir=work_dir,
+        chunk_rows=chunk_rows,
+        chunk_bytes=chunk_bytes,
+        budget=budget,
+        is_cancelled=is_cancelled,
+        prefix=f"{cursor_name}-run-",
+    )
     columns: list[ColumnMeta] = []
     total = 0
-    # itersize 控制每次网络往返的行数，内存里同时只有一批
+    # itersize 控制每次网络往返的行数，内存里同时只有一批；
+    # 宽行场景下行数上限比 chunk_rows 小得多，瞬时驻留随之有界
     cur = conn.cursor(name=cursor_name, binary=False, withhold=False)
-    cur.itersize = min(chunk_rows, 10000)
+    cur.itersize = max(1, min(fetch_batch_rows, chunk_rows))
     try:
         # 执行前检查点：若取消在查询派发前到达，直接结束，不向服务器发 SQL
         if is_cancelled():
@@ -189,7 +202,6 @@ def describe_and_stream(
                 )
             columns.append(ColumnMeta(name=desc.name, pg_type=pg_type))
 
-        batch: list[tuple[Any, ...]] = []
         while True:
             if is_cancelled():
                 from .external_merge import JobCancelled
@@ -200,13 +212,9 @@ def describe_and_stream(
             if not rows:
                 break
             _validate_row_types(rows, columns)
-            batch.extend(rows)
+            # add 内部先向共享预算申请字节，两侧总驻留因此被硬性限制
+            writer.add(rows)
             total += len(rows)
-            if len(batch) >= chunk_rows:
-                writer.add(batch)
-                batch = []
-        if batch:
-            writer.add(batch)
         runs = writer.finish()
         return columns, runs, total
     finally:

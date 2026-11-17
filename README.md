@@ -84,14 +84,22 @@ curl -X POST http://localhost:8000/jobs -H 'Content-Type: application/json' -d '
 两条读取连接分别 `SET TRANSACTION SNAPSHOT` 绑定**同一个快照**。
 核对期间其他会话对 `readings` / `meters` 的更正照常提交，但对本轮不可见。
 
-### 内存有界的外部归并（不全量载入、不靠哈希判等）
+### 内存与句柄双有界的外部归并（不全量载入、不靠哈希判等）
 
-1. 命名服务端游标按 `itersize` 分批拉取，客户端从不缓存整表；
-2. 每 `SORT_CHUNK_ROWS`（默认 2 万）行在进程内排序，逐行流式 pickle 落盘为一个 run；
-3. 归并阶段对两侧 run 做单轮 k 路堆归并（堆中每流只驻留一行），
-   键随行走，按全序键聚合等值组后比较两侧次数；
-4. 差异明细最多保留 20 种，但总行数、差异组总数等计数覆盖全量数据；
-5. 全程不使用整表哈希作为判等依据。
+1. 命名服务端游标按受限 `FETCH_BATCH_ROWS` 分批拉取，客户端从不缓存整表；
+2. 双路读取线程共享同一个内存预算 `READ_MEMORY_BUDGET_BYTES`：每批行先按
+   估算字节申请预算再入缓冲，任一侧达到 `SORT_CHUNK_ROWS` 行或
+   `SORT_CHUNK_BYTES` 字节即进程内排序、逐行流式 pickle 落盘，并立即归还
+   字节。窄宽混合行按实际字节自适应切块，宽文本不会因只按行数切块而
+   突破 128MiB，也不会被截断或拒收；
+3. 归并采用**自适应有界扇入分层（多相）归并**：扇入按进程软 `NOFILE`
+   计算（两侧各半并预留连接/标准流余量，封顶 256、保底 4）。run 数不超过
+   扇入时单轮 k 路堆归并、零中间落盘；run 数多于可用句柄时自动分层，
+   任意时刻同时打开的 run 文件数不超过当前扇入，堆中每流只驻留一行；
+4. 键随行走，按全序键聚合等值组后比较两侧次数；
+5. 差异明细最多保留 20 种，但总行数、差异组总数等计数覆盖全量数据；
+6. 全程不使用整表哈希作为判等依据；分层产生的中间暂存与原始 run 统一
+   由任务收尾的暂存清空流程回收。
 
 ### 单名额、30 秒时限与终止语义
 
@@ -109,7 +117,10 @@ curl -X POST http://localhost:8000/jobs -H 'Content-Type: application/json' -d '
 | `PG_DSN` | `postgresql://recon:recon@postgres:5432/recon` | 数据库连接串 |
 | `JOB_TIMEOUT_SECONDS` | `30` | 单轮硬时限 |
 | `PG_STATEMENT_TIMEOUT_MS` | `28000` | 服务端单语句超时（留 2s 收尾余量） |
-| `SORT_CHUNK_ROWS` | `20000` | 单个排序块行数 |
+| `SORT_CHUNK_ROWS` | `20000` | 单个排序块行数上限 |
+| `SORT_CHUNK_BYTES` | `16777216`（16MiB） | 单个排序块估算字节上限，宽行按字节提前切块 |
+| `READ_MEMORY_BUDGET_BYTES` | `41943040`（40MiB） | 双路读取共享的驻留内存预算（两侧缓冲字节之和硬上限） |
+| `FETCH_BATCH_ROWS` | `200` | 服务端游标单批拉取行数，限制宽行瞬时驻留 |
 | `MAX_DIFF_TYPES` | `20` | 差异展示上限 |
 | `WORK_DIR` | `/tmp/recon-work` | 外部排序暂存目录（独立卷） |
 
@@ -123,24 +134,32 @@ python -m pytest tests/ -q
 python scripts/load_test.py
 ```
 
-实测（受限沙箱环境，容器内通常更快）：两侧各 504,012 行、
-含一次重复计入差异，端到端约 16 秒，进程峰值 RSS 约 68 MiB，
-暂存峰值约 44 MiB，结束后暂存目录清空、名额释放。
+实测（受限沙箱环境，容器内通常更快）：
+
+- 两侧各 504,012 窄行、含一次重复计入差异：端到端约 20 秒，进程峰值 RSS
+  约 70 MiB，暂存峰值约 44 MiB，结束后暂存目录清空、名额释放；
+- 两侧各 12,000 行、每行 16KiB 文本（约 192MiB 文本负载）：默认配置下
+  端到端峰值 RSS 约 97 MiB（128MiB 限内、约 31MiB 余量），文本逐字节精确
+  核对，重复计入差异的文本长度完整；
+- `NOFILE=32` 且每侧数十个暂存段：自适应扇入降到 8，分层归并正常完成，
+  不出现 `Too many open files`；
+- 极小内存预算下取消：阻塞在预算上的读取线程在 0.2s 等待分段内响应取消，
+  任务秒级到终态、线程不泄漏、暂存清空、名额释放。
 
 ## 7. 目录结构
 
 ```
 app/
-  config.py          运行期配置
+  config.py          运行期配置（含共享内存预算、字节分块、拉取批次）
   sqlvalidation.py   只读 SELECT 静态校验
   db.py              快照会话、只读连接、命名游标流式拉取、列类型闸门
-  external_merge.py  流式 run、k 路归并、多重集核对
+  external_merge.py  共享内存预算、流式 run、自适应扇入分层归并、多重集核对
   manager.py         单名额编排、看门狗、取消/超时/失败的统一收尾
   models.py          API 模型
   main.py            FastAPI 路由
 sql/init.sql         源表、示例数据、示例查询
 scripts/             压测数据生成与负载脚本
-tests/               单元与集成测试
+tests/               单元与集成测试（含宽行、多段归并回归）
 docker-compose.yml   应用（128MiB 上限）+ PostgreSQL
 Dockerfile
 ```

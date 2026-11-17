@@ -31,6 +31,12 @@ services:
       PG_DSN: postgresql://recon:recon@postgres:5432/recon
       JOB_TIMEOUT_SECONDS: "30"
       SORT_CHUNK_ROWS: "20000"
+      # 单排序块字节上限：宽文本（如 16KiB/行）按字节提前切块，避免撑爆内存
+      SORT_CHUNK_BYTES: "16777216"
+      # 双路读取共享的驻留内存预算（字节），两侧缓冲之和的硬上限
+      READ_MEMORY_BUDGET_BYTES: "41943040"
+      # 服务端游标单批行数上限，限制宽行批次的瞬时驻留
+      FETCH_BATCH_ROWS: "200"
       MAX_DIFF_TYPES: "20"
       WORK_DIR: /tmp/recon-work
       PG_STATEMENT_TIMEOUT_MS: "28000"
